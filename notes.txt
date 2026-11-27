@@ -9,11 +9,70 @@ GUÍA DE ESTUDIO Y DEFENSA TÉCNICA - FINTECH DISTRIBUTED PLATFORM
 - qa-suite: Motor de control de calidad (Pytest, JSON Schema, Playwright).
 
 2. MAPA DE POO (Programación Orientada a Objetos)
-[Pendiente Etapa 1] - Value Objects inmutables (Money) y Entidades con encapsulamiento (Account, Transfer).
+[Etapa 1 hecha para ledger-service] Ver detalle por archivo en la sección 5.
+Pendiente: Transfer (payments-service).
 
 3. MAPA DE PRINCIPIOS SOLID
-[Pendiente Etapa 1] - S (Capas router/service/repo), O (Reglas de validación), L (Repositorios sustituibles), I (Protocols pequeños), D (Inyección de dependencias).
+[Etapa 1 hecha para ledger-service, ver sección 5] - S (Capas router/service/repo), O (Reglas de validación), L (Repositorios sustituibles), I (Protocols pequeños), D (Inyección de dependencias).
 
 4. PATRONES DE MICROSERVICIOS Y RESILIENCIA
 [Pendiente Etapa 1/2] - Idempotency-Key en Redis, X-Correlation-ID, Migraciones con Alembic, Auth JWT.
+================================================================
+
+5. DETALLE POR ARCHIVO: services/ledger-service (Etapa 1)
+
+domain/exceptions.py
+- POO: jerarquía de herencia (DomainError -> errores específicos). Permite capturar
+  "cualquier error de negocio" o uno concreto.
+- SOLID: S (solo define errores). O: nuevos errores se agregan sin tocar código existente.
+- Defensa: el dominio expresa fallos en lenguaje de negocio; la capa api los traducirá
+  a HTTP (422/404/409) sin que el dominio conozca HTTP.
+
+domain/value_objects.py (Money)
+- POO: Value Object inmutable (@dataclass(frozen=True)), igualdad por valor, validación
+  en __post_init__ (nunca existe un Money inválido). Decimal, jamás float
+  (0.1 + 0.2 != 0.3 en float; en dinero es un bug grave).
+- SOLID: S (encapsula aritmética y reglas de moneda).
+- Defensa: "make illegal states unrepresentable". Las operaciones devuelven un Money
+  nuevo en lugar de mutar, lo que elimina efectos colaterales y es seguro en concurrencia.
+
+domain/entities.py (Account)
+- POO: encapsulamiento (atributos privados, saldo solo modificable vía credit()/debit()),
+  la entidad protege sus propias invariantes (saldo >= 0, cuenta activa, monto > 0,
+  misma moneda). Identidad por id, a diferencia del Value Object.
+- SOLID: S (reglas de negocio de una cuenta, nada de persistencia). Open/Closed
+  parcial: Money ya valida moneda, Account compone esa regla en vez de duplicarla.
+- Defensa: "Tell, don't ask": el servicio no lee el saldo para decidir; le dice a la
+  cuenta que debite y ella decide. Evita modelos anémicos.
+
+domain/repositories.py
+- SOLID: I (AccountReader y AccountWriter segregados: un consumidor de solo lectura no
+  depende de save()). D (el dominio define el contrato; la infraestructura lo implementa).
+  AccountRepository compone ambos.
+- Defensa: typing.Protocol es tipado estructural (duck typing verificable): las
+  implementaciones no necesitan heredar, solo cumplir la firma.
+
+infrastructure/in_memory_repository.py
+- SOLID: L (puede sustituir a cualquier AccountRepository, p. ej. el futuro repositorio
+  SQLAlchemy, sin cambiar el servicio ni los tests). D (detalle depende de la abstracción).
+- Defensa: sirve de doble de prueba real: tests rápidos sin DB y misma semántica del contrato.
+
+application/use_cases.py (AccountService)
+- SOLID: D (recibe AccountReader y AccountWriter por constructor, inyección de
+  dependencias; no importa infraestructura). I (declara solo lo que usa). S (orquesta
+  casos de uso; las reglas viven en el dominio).
+- Defensa: se puede testear sin framework ni DB; cambiar Postgres por otra cosa no
+  toca esta capa.
+
+tests/unit/test_account_service.py
+- Cubre: operaciones válidas, monto cero/negativo/float, monedas distintas, fondos
+  insuficientes (saldo intacto), cuenta inactiva, cuenta inexistente, inmutabilidad.
+- Defensa: tests de comportamiento contra el servicio real usando el repo en memoria
+  (LSP en acción), sin mocks frágiles.
+
+Decisiones a mencionar en entrevista:
+- Repositorios async desde ya, para encajar con SQLAlchemy async sin romper contratos.
+- Se agregó AccountNotFoundError (no pedida) para no devolver None desde el servicio.
+- Race conditions (dos débitos simultáneos) NO se resuelven aquí: se resolverán en la
+  capa de infraestructura con transacciones/bloqueo (SELECT ... FOR UPDATE) u optimistic locking.
 ====================================================================
