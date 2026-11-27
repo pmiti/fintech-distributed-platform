@@ -3,10 +3,18 @@ name = "ledger-service"
 version = "0.1.0"
 description = "Ledger service: accounts and balances"
 requires-python = ">=3.12,<3.13"
-dependencies = []
+dependencies = [
+    "alembic>=1.20.1",
+    "asyncpg>=0.32.0",
+    "fastapi>=0.165.0",
+    "pydantic-settings>=2.16.3",
+    "sqlalchemy[asyncio]>=2.1.9",
+    "uvicorn[standard]>=0.54.0",
+]
 
 [dependency-groups]
 dev = [
+    "httpx>=0.29.0",
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
 ]

@@ -9,7 +9,10 @@ class InMemoryAccountRepository:
     def __init__(self) -> None:
         self._accounts: dict[str, Account] = {}
 
-    async def get_by_id(self, account_id: str) -> Account | None:
+    async def get_by_id(
+        self, account_id: str, for_update: bool = False
+    ) -> Account | None:
+        # for_update is accepted to honor the contract; there is no locking here.
         return self._accounts.get(account_id)
 
     async def save(self, account: Account) -> None:

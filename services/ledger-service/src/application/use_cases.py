@@ -21,19 +21,22 @@ class AccountService:
         return account
 
     async def get_account(self, account_id: str) -> Account:
-        account = await self._reader.get_by_id(account_id)
+        return await self._load(account_id)
+
+    async def _load(self, account_id: str, for_update: bool = False) -> Account:
+        account = await self._reader.get_by_id(account_id, for_update=for_update)
         if account is None:
             raise AccountNotFoundError(f"Account {account_id} not found")
         return account
 
     async def credit_account(self, account_id: str, amount: Money) -> Account:
-        account = await self.get_account(account_id)
+        account = await self._load(account_id, for_update=True)
         account.credit(amount)
         await self._writer.save(account)
         return account
 
     async def debit_account(self, account_id: str, amount: Money) -> Account:
-        account = await self.get_account(account_id)
+        account = await self._load(account_id, for_update=True)
         account.debit(amount)
         await self._writer.save(account)
         return account

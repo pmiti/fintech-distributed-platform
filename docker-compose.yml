@@ -1,0 +1,52 @@
+# Local development only: the default credentials are not meant for production.
+services:
+  ledger-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ledger
+      POSTGRES_PASSWORD: ${LEDGER_DB_PASSWORD:-ledger_dev_password}
+      POSTGRES_DB: ledger
+    ports:
+      - "127.0.0.1:5433:5432" # host access for tests and Alembic autogenerate
+    volumes:
+      - ledger-db-data:/var/lib/postgresql/data
+    healthcheck:
+      # -h forces TCP: the temporary server used during initialization only
+      # listens on the Unix socket and must not count as healthy.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "ledger", "-d", "ledger"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  ledger-service:
+    build: ./services/ledger-service
+    environment:
+      DATABASE_URL: postgresql+asyncpg://ledger:${LEDGER_DB_PASSWORD:-ledger_dev_password}@ledger-db:5432/ledger
+      SERVICE_NAME: ledger-service
+      LOG_LEVEL: INFO
+    # Migrate, then exec so uvicorn is PID 1 and receives stop signals.
+    # Fine for a single replica; with several, run migrations as a separate job.
+    command:
+      - sh
+      - -c
+      - >-
+        alembic upgrade head &&
+        exec uvicorn --factory src.api.main:create_app
+        --host 0.0.0.0 --port 8000 --no-access-log
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      ledger-db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  ledger-db-data:

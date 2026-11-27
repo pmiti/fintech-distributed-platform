@@ -16,6 +16,13 @@ class Account:
         self._balance = Money.zero(currency)
         self._active = active
 
+    @classmethod
+    def restore(cls, account_id: str, balance: Money, active: bool) -> "Account":
+        """Rebuild an already persisted account. Only meant for repositories."""
+        account = cls(account_id=account_id, currency=balance.currency, active=active)
+        account._balance = balance
+        return account
+
     @property
     def id(self) -> str:
         return self._id

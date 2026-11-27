@@ -16,7 +16,8 @@ Pendiente: Transfer (payments-service).
 [Etapa 1 hecha para ledger-service, ver sección 5] - S (Capas router/service/repo), O (Reglas de validación), L (Repositorios sustituibles), I (Protocols pequeños), D (Inyección de dependencias).
 
 4. PATRONES DE MICROSERVICIOS Y RESILIENCIA
-[Pendiente Etapa 1/2] - Idempotency-Key en Redis, X-Correlation-ID, Migraciones con Alembic, Auth JWT.
+[Hecho en ledger-service, ver sección 6] X-Correlation-ID, migraciones con Alembic.
+[Pendiente] Idempotency-Key en Redis, Auth JWT.
 ================================================================
 
 5. DETALLE POR ARCHIVO: services/ledger-service (Etapa 1)
@@ -73,6 +74,120 @@ tests/unit/test_account_service.py
 Decisiones a mencionar en entrevista:
 - Repositorios async desde ya, para encajar con SQLAlchemy async sin romper contratos.
 - Se agregó AccountNotFoundError (no pedida) para no devolver None desde el servicio.
-- Race conditions (dos débitos simultáneos) NO se resuelven aquí: se resolverán en la
-  capa de infraestructura con transacciones/bloqueo (SELECT ... FOR UPDATE) u optimistic locking.
+- Race conditions (dos débitos simultáneos): resueltas en la Etapa 2 con
+  SELECT ... FOR UPDATE (sección 6.3). El caso de uso pide el bloqueo con
+  get_by_id(for_update=True); la infraestructura decide cómo implementarlo.
+====================================================================
+
+6. ETAPA 2: INFRAESTRUCTURA, API Y DOCKER (ledger-service)
+
+6.0 Flujo de un request
+  middleware (Correlation-ID) -> router (valida con Pydantic) -> provide_session abre
+  transacción -> AccountService -> PostgresAccountRepository -> COMMIT -> respuesta.
+- api/main.py es el "composition root": el único lugar que conoce las implementaciones
+  concretas y las conecta (D de SOLID). create_app() es una factory: importar el módulo
+  no exige variables de entorno y cada test crea su app con su propia configuración.
+- routes.py recibe sus dependencias en create_router(): no importa SQLAlchemy.
+- api/errors.py es la única tabla excepción de dominio -> HTTP:
+  404 AccountNotFound | 409 InsufficientFunds, InactiveAccount |
+  422 InvalidAmount, CurrencyMismatch.
+
+6.1 SQLAlchemy 2.0 async
+- Engine: uno por proceso, administra el pool de conexiones. Se crea sin conectar.
+  pool_pre_ping descarta conexiones muertas (p. ej. si Postgres se reinicia).
+- AsyncSession: una por request. Es una unidad de trabajo y NO se comparte entre
+  tareas asyncio concurrentes. async_sessionmaker es la fábrica.
+- expire_on_commit=False: por defecto, tras el commit los atributos expiran y al
+  leerlos se dispararía I/O implícito, que en async falla (MissingGreenlet).
+- Sintaxis 2.0: select(...) + await session.execute(); modelos con Mapped[...].
+- Transacción por request: "async with session_factory.begin()" hace COMMIT si todo
+  sale bien y ROLLBACK si hay excepción. El repositorio nunca hace commit (solo
+  flush): si lo hiciera, soltaría el bloqueo antes de terminar el caso de uso.
+- Trampa de FastAPI: Depends(..., scope="function") hace que el COMMIT ocurra ANTES
+  de enviar la respuesta. Con el scope por defecto ("request"), el cliente podría
+  recibir 200 y el commit fallar después.
+- Modelo ORM != entidad de dominio: el repositorio traduce entre ambos.
+  Account.restore() reconstruye una cuenta guardada sin exponer un setter de saldo.
+- Dinero: NUMERIC(18,2) <-> Decimal, nunca float. Postgres redondea EN SILENCIO los
+  decimales sobrantes, así que se rechazan antes (schema Pydantic y repositorio),
+  igual que los montos o saldos que no caben en la columna (422 en vez de 500).
+  En JSON los montos con decimales viajan como string ("10.50"); un float se rechaza
+  porque ya habría perdido precisión al parsearse.
+- CHECK (balance >= 0): defensa en profundidad si alguien escribe sin pasar por el dominio.
+
+6.2 Alembic
+- Es el control de versiones del esquema. Cada revisión tiene upgrade()/downgrade() y
+  la tabla alembic_version guarda cuál está aplicada.
+- env.py en modo async: la API de Alembic es síncrona y se ejecuta con
+  connection.run_sync(). La URL sale de config.py (no hay credenciales en alembic.ini).
+- --autogenerate compara Base.metadata con la base real y propone la migración; SIEMPRE
+  se revisa a mano (p. ej. un rename lo ve como drop + add y perderías datos).
+- "alembic check" avisa si los modelos cambiaron y falta una migración.
+- naming_convention: nombres de constraints predecibles para migraciones futuras.
+- En compose se corre "alembic upgrade head" al arrancar. Sirve con una réplica; con
+  varias conviene un job aparte para que no migren a la vez.
+
+6.3 Bloqueo pesimista (SELECT ... FOR UPDATE)
+- Problema (lost update): saldo 100; dos requests leen 100, ambos validan, ambos
+  escriben. Se entrega dinero dos veces y una escritura pisa a la otra. Validar en el
+  dominio no basta: cada request valida contra un dato ya viejo.
+- Solución: FOR UPDATE bloquea la fila hasta COMMIT/ROLLBACK. El segundo request espera
+  y, al continuar (READ COMMITTED, el nivel por defecto), lee el saldo ya actualizado.
+- Requisitos: leer con lock y escribir en la MISMA transacción. populate_existing=True
+  evita usar una copia vieja guardada en la sesión (identity map).
+- Un SELECT normal no se bloquea (MVCC): get_account no usa lock.
+- Evidencia (tests/integration, 25 requests concurrentes):
+    sin FOR UPDATE: los 25 débitos de 10 sobre saldo 100 respondieron 200 (debían ser
+    10) y de 25 créditos de 1.00 el saldo final fue 2.00 en vez de 25.00.
+    con FOR UPDATE: 10 débitos OK + 15 con 409, saldo 0.00; créditos = 25.00.
+- El CHECK balance >= 0 no habría evitado esto: cada UPDATE escribía un valor >= 0.
+- Alternativas: optimistic locking (columna version y reintentar; mejor con poca
+  contención) o UPDATE atómico "SET balance = balance - x WHERE balance >= x" (rápido,
+  pero saca la regla de negocio del dominio). Pesimista: simple y correcto para saldos.
+- Costo: serializa las operaciones sobre una misma cuenta; mantener transacciones cortas.
+- A futuro (transferencias entre 2 cuentas): bloquear siempre en el mismo orden
+  (p. ej. por id) para evitar deadlocks.
+- OJO: el lock NO da idempotencia. Si un cliente reintenta un débito, se aplica dos
+  veces (pendiente: Idempotency-Key). Tampoco queda historial de movimientos todavía.
+
+6.4 Correlation-ID
+- Un ID por request que permite seguirlo en los logs de todos los servicios.
+  Si llega X-Correlation-ID se reutiliza; si no, se genera un UUID. Se devuelve en la
+  respuesta (también en los 500). Al llamar a otro servicio habrá que reenviarlo.
+- Se valida (máx. 128, solo [A-Za-z0-9._-]) porque es entrada del cliente que acaba
+  en logs y headers.
+- ContextVar: cada tarea asyncio tiene su propio valor, así requests concurrentes no se
+  mezclan. Una variable global sería un bug; threading.local no sirve en asyncio.
+- Middleware ASGI "puro" en vez de BaseHTTPMiddleware, que tiene problemas conocidos
+  de propagación de contextvars.
+- Logs en JSON (una línea por evento): se filtran por campo (correlation_id,
+  status_code) en herramientas de observabilidad.
+- Correlation-ID no es lo mismo que Idempotency-Key: el primero es para trazabilidad.
+
+6.5 Docker
+- Multi-stage: "builder" instala con uv (--locked: respeta uv.lock); "runtime" copia
+  solo el .venv y el código, sin herramientas de build ni dependencias de test.
+- Usuario no-root (uid 10001) y archivos propiedad de root (la app no puede alterarlos).
+- "exec uvicorn": queda como PID 1 y recibe las señales de parada.
+- depends_on + condition: service_healthy: espera a que Postgres acepte conexiones, no
+  solo a que el contenedor exista.
+- /health hace SELECT 1 con timeout: 200 si hay base, 503 si no.
+- Puertos solo en 127.0.0.1. Las credenciales por defecto son solo para desarrollo.
+
+6.6 Comandos útiles
+  docker compose up -d --build            (desde la raíz; API en :8000/docs)
+  docker compose logs -f ledger-service
+  docker compose down                     (con -v además BORRA los datos)
+
+  Tests (desde services/ledger-service):
+  uv run pytest                           (unitarios; los de integración se saltan)
+
+  Integración: usan una base aparte porque insertan datos. Crearla una sola vez:
+  docker compose exec ledger-db createdb -U ledger ledger_test
+  export DATABASE_URL=postgresql+asyncpg://ledger:ledger_dev_password@127.0.0.1:5433/ledger_test
+  uv run alembic upgrade head
+  TEST_DATABASE_URL=$DATABASE_URL uv run pytest
+
+  Nueva migración (con DATABASE_URL apuntando a una base al día):
+  uv run alembic revision --autogenerate -m "descripcion"
 ====================================================================
