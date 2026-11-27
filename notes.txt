@@ -1,0 +1,19 @@
+====================================================================
+GUÍA DE ESTUDIO Y DEFENSA TÉCNICA - FINTECH DISTRIBUTED PLATFORM
+====================================================================
+
+1. ARQUITECTURA GENERAL (MONOREPO)
+- ledger-service: Core contable. PostgreSQL (ACID estricto).
+- payments-service: Orquestador de transferencias. PostgreSQL + Redis (idempotencia y broker).
+- audit-worker: Consumidor asíncrono Celery + MongoDB (persistencia políglota) + LocalStack S3.
+- qa-suite: Motor de control de calidad (Pytest, JSON Schema, Playwright).
+
+2. MAPA DE POO (Programación Orientada a Objetos)
+[Pendiente Etapa 1] - Value Objects inmutables (Money) y Entidades con encapsulamiento (Account, Transfer).
+
+3. MAPA DE PRINCIPIOS SOLID
+[Pendiente Etapa 1] - S (Capas router/service/repo), O (Reglas de validación), L (Repositorios sustituibles), I (Protocols pequeños), D (Inyección de dependencias).
+
+4. PATRONES DE MICROSERVICIOS Y RESILIENCIA
+[Pendiente Etapa 1/2] - Idempotency-Key en Redis, X-Correlation-ID, Migraciones con Alembic, Auth JWT.
+====================================================================
